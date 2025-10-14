@@ -1,0 +1,27 @@
+devices:
+  - name: "shelly-pro3em-house"
+    address: "http://192.168.0.10"
+    username: ""
+    password: ""
+    id: 0
+    endpoints:
+      - "rpc/EM.GetStatus?id=0"
+      - "rpc/Sys.GetStatus"
+      - "rpc/WiFi.GetStatus"
+
+  - name: "shelly-waschkueche"
+    address: "http://192.168.0.11"
+    username: ""
+    password: ""
+    id: 0
+    endpoints:
+      - "rpc/PM1.GetStatus?id=0"
+      - "rpc/Sys.GetStatus"
+      - "rpc/WiFi.GetStatus"
+
+server:
+  listen_address: ":9905"
+  request_timeout_seconds: 5
+
+metrics:
+  enable_go_runtime: false

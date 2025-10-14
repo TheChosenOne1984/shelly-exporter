@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+/build
+/bin
+dist
+*.log
+*.out
+*.coverprofile
+*.swp
+*.tmp
+*.config*
