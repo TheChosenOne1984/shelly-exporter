@@ -2,6 +2,7 @@
 
 The **Shelly Exporter** is a lightweight [Prometheus](https://prometheus.io/) exporter written in Go that collects metrics from one or more [Shelly devices](https://shelly.cloud/) via their HTTP RPC API and exposes them under a `/metrics` endpoint.  
 It is primarily designed for energy monitoring devices such as **Shelly Pro 3EM**, but can work with any Shelly device supporting the HTTP RPC interface.
+Please be aware that most of the code was created hand in hand with an AI agent. I'm not a developer and code quality is likely to be not production ready.
 
 ---
 
@@ -22,7 +23,7 @@ It is primarily designed for energy monitoring devices such as **Shelly Pro 3EM*
 Clone the repository and build the exporter:
 
 ```bash
-git clone git@github.com-private:privat/shelly-exporter.git
+git clone https://github.com/TheChosenOne1984/shelly-exporter.git
 cd shelly-exporter
 go build -o shelly-exporter
 ```
@@ -37,7 +38,7 @@ devices:
     address: "http://192.168.0.49"
     username: "user"
     password: "passwort"
-    id: 0
+    id: 0 # fallback in case no endpoints are listed
     endpoints:
       - "rpc/EM.GetStatus?id=0"
       # - "rpc/Sys.GetStatus"
@@ -45,8 +46,8 @@ devices:
 
   - name: "shelly-pro3em-garage"
     address: "http://192.168.0.50"
-    username: "user2"
-    password: "pass2"
+    username: "user"
+    password: "password"
     id: 0
     endpoints:
       - "rpc/EM.GetStatus?id=0"
