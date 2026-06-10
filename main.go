@@ -1,18 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/icholy/digest"
@@ -98,7 +102,6 @@ func loadConfig(path string) (*Config, error) {
 type ShellyCollector struct {
 	device       DeviceConfig
 	client       *http.Client
-	timeout      time.Duration
 	upDesc       *prometheus.Desc
 	durationDesc *prometheus.Desc
 	valueDesc    *prometheus.Desc
@@ -117,9 +120,8 @@ func NewShellyCollector(device DeviceConfig, timeout time.Duration) *ShellyColle
 	}
 
 	return &ShellyCollector{
-		device:  device,
-		client:  httpClient,
-		timeout: timeout,
+		device: device,
+		client: httpClient,
 		upDesc: prometheus.NewDesc(
 			"shelly_em_up",
 			"Whether the last scrape of all configured RPC endpoints was successful (1 = yes, 0 = no).",
@@ -196,18 +198,17 @@ func (c *ShellyCollector) fetchAndFlatten(relativePath string) (map[string]float
 	rel := strings.TrimLeft(relativePath, "/")
 	url := fmt.Sprintf("%s/%s", base, rel)
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// perform digest handshake via Transport directly
-	resp, err := c.client.Transport.RoundTrip(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
 	}
@@ -278,6 +279,8 @@ func sanitizeKeys(in map[string]float64) map[string]float64 {
 	return out
 }
 
+// guessTotalActivePower returns the first exact key match from a list of
+// well-known candidate names for total active power.
 func guessTotalActivePower(m map[string]float64) (float64, bool) {
 	candidates := []string{
 		"total_act_power", "total_active_power", "total_power", "active_power_total",
@@ -286,17 +289,11 @@ func guessTotalActivePower(m map[string]float64) (float64, bool) {
 		if v, ok := m[c]; ok {
 			return v, true
 		}
-		for k, v := range m {
-			low := strings.ToLower(k)
-			if strings.Contains(low, c) {
-				return v, true
-			}
-		}
 	}
 	return 0, false
 }
 
-// e.g. "rpc/EM.GetStatus?id=0" -> "rpc.EM_GetStatus.id_0"
+// e.g. "rpc/EM.GetStatus?id=0" -> "rpc.EM.GetStatus.id_0"
 func endpointKeyPrefix(endpoint string) string {
 	ep := strings.TrimSpace(endpoint)
 	ep = strings.TrimLeft(ep, "/")
@@ -368,23 +365,108 @@ func metricsHandler(cfg *Config) http.Handler {
 	})
 }
 
+func healthzHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"ok"}`)
+	})
+}
+
+func landingPageHandler(cfg *Config) http.Handler {
+	names := strings.Join(deviceNames(cfg.Devices), ", ")
+	body := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en"><head><title>Shelly Exporter</title></head>
+<body>
+<h1>Shelly Exporter</h1>
+<p><a href="/metrics">Metrics</a></p>
+<p>Configured devices: %s</p>
+</body></html>`, names)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, body)
+	})
+}
+
+// runHealthCheck calls /healthz on the running instance and exits with 0 (ok) or 1 (fail).
+// It reads the listen address from the config so the port is always in sync.
+func runHealthCheck(configPath string) {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "health-check: failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	_, port, err := net.SplitHostPort(cfg.Server.ListenAddress)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "health-check: invalid listen_address %q: %v\n", cfg.Server.ListenAddress, err)
+		os.Exit(1)
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://localhost:" + port + "/healthz")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "health-check: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "health-check: unexpected status %d\n", resp.StatusCode)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 // -------------------- main --------------------
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to the YAML configuration")
+	healthCheck := flag.Bool("health-check", false, "Perform a health check against the running instance and exit")
 	flag.Parse()
+
+	if *healthCheck {
+		runHealthCheck(*configPath)
+	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	http.Handle("/metrics", metricsHandler(cfg))
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metricsHandler(cfg))
+	mux.Handle("/healthz", healthzHandler())
+	mux.Handle("/", landingPageHandler(cfg))
+
+	srv := &http.Server{
+		Addr:    cfg.Server.ListenAddress,
+		Handler: mux,
+	}
 
 	log.Printf("starting Shelly exporter on %s | devices: [%s] | go_runtime_metrics=%v",
 		cfg.Server.ListenAddress, strings.Join(deviceNames(cfg.Devices), ", "), cfg.Metrics.EnableGoRuntime)
 
-	if err := http.ListenAndServe(cfg.Server.ListenAddress, nil); err != nil {
-		log.Fatalf("http server error: %v", err)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("http server error: %v", err)
+		}
+	}()
+
+	<-quit
+	log.Println("shutting down...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("shutdown error: %v", err)
 	}
+	log.Println("stopped")
 }
