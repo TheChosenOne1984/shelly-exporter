@@ -3,7 +3,7 @@
 The **Shelly Exporter** is a lightweight [Prometheus](https://prometheus.io/) exporter written in Go that collects metrics from one or more [Shelly devices](https://shelly.cloud/) via their HTTP RPC API and exposes them under a `/metrics` endpoint.  
 It is primarily designed for energy monitoring devices such as **Shelly Pro 3EM**, but can work with any Shelly device supporting the HTTP RPC interface.
 
-> This project was developed with the assistance of an AI agent ([Claude](https://claude.ai/claude-code) by Anthropic).
+> This project was developed with the assistance of an AI agent.
 
 ---
 
