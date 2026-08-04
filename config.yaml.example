@@ -22,6 +22,10 @@ devices:
 server:
   listen_address: ":9905"
   request_timeout_seconds: 5
+  # After a device answers with HTTP 429 (Too Many Requests), pause scraping it
+  # for this long before trying again. Shelly firmware 2.0.0 can get stuck in a
+  # "too many requests" state for several minutes; hammering it only prolongs it.
+  rate_limit_cooldown_seconds: 600
 
 metrics:
   enable_go_runtime: false

@@ -15,6 +15,7 @@ It is primarily designed for energy monitoring devices such as **Shelly Pro 3EM*
 - Allows selecting a specific device dynamically via the query parameter `?device=<name>`
 - Optional exposure of Go runtime and process metrics
 - Health check endpoint (`/healthz`) with built-in Docker `HEALTHCHECK` support
+- Resilient to Shelly firmware 2.0.0 rate limiting: reuses HTTP/digest sessions and backs off on HTTP 429
 - Simple YAML configuration
 - Multi-arch Docker image (`linux/amd64`, `linux/arm64`)
 - Written in pure Go (no external dependencies other than Prometheus client libraries)
@@ -66,10 +67,28 @@ devices:
 server:
   listen_address: ":9905"
   request_timeout_seconds: 5
+  # Pause scraping a device for this long after it returns HTTP 429 (default 600).
+  rate_limit_cooldown_seconds: 600
 
 metrics:
   enable_go_runtime: false
 ```
+
+### Rate limiting (HTTP 429)
+
+Shelly firmware **2.0.0** has a bug in its digest-auth path that can push a
+device into a sticky *"429 Too many requests"* state for several minutes
+([home-assistant/core#177257](https://github.com/home-assistant/core/issues/177257)).
+Two things keep this exporter from triggering and aggravating it:
+
+- **Long-lived HTTP clients** — each device's connection and digest challenge
+  are created once and reused across scrapes, so the exporter does **not** repeat
+  the unauthenticated → `401` → auth handshake on every scrape (that challenge
+  pattern is what trips the firmware bug).
+- **Cooldown on 429** — when a device answers with `429`, the exporter stops
+  scraping it for `rate_limit_cooldown_seconds` (default **600 s / 10 min**)
+  instead of hammering it. During the cooldown `shelly_em_up` is `0` and
+  `shelly_em_rate_limited` is `1`.
 
 ---
 

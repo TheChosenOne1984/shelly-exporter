@@ -2,9 +2,93 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
+
+// collectMetrics runs the collector once and returns the emitted metrics.
+func collectMetrics(t *testing.T, c *ShellyCollector) []prometheus.Metric {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 64)
+	go func() {
+		c.Collect(ch)
+		close(ch)
+	}()
+	var out []prometheus.Metric
+	for m := range ch {
+		out = append(out, m)
+	}
+	return out
+}
+
+// gaugeValue extracts the value of a metric whose Desc string contains want.
+func gaugeValue(t *testing.T, metrics []prometheus.Metric, want string) (float64, bool) {
+	t.Helper()
+	for _, m := range metrics {
+		if !strings.Contains(m.Desc().String(), want) {
+			continue
+		}
+		var dm dto.Metric
+		if err := m.Write(&dm); err != nil {
+			t.Fatalf("write metric: %v", err)
+		}
+		return dm.GetGauge().GetValue(), true
+	}
+	return 0, false
+}
+
+func TestCollectorRateLimitCooldown(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("Too many requests"))
+	}))
+	defer srv.Close()
+
+	dev := DeviceConfig{
+		Name:      "test",
+		Address:   srv.URL,
+		Username:  "u",
+		Password:  "p",
+		Endpoints: []string{"rpc/EM.GetStatus?id=0", "rpc/Sys.GetStatus"},
+	}
+	c := NewShellyCollector(dev, 2*time.Second, time.Minute)
+
+	// First scrape hits the device, gets 429, enters cooldown.
+	m1 := collectMetrics(t, c)
+	if v, ok := gaugeValue(t, m1, "shelly_em_up"); !ok || v != 0 {
+		t.Errorf("first scrape: expected up=0, got %v (ok=%v)", v, ok)
+	}
+	if v, ok := gaugeValue(t, m1, "shelly_em_rate_limited"); !ok || v != 1 {
+		t.Errorf("first scrape: expected rate_limited=1, got %v (ok=%v)", v, ok)
+	}
+	firstHits := atomic.LoadInt32(&hits)
+	if firstHits == 0 {
+		t.Fatal("first scrape should have contacted the device")
+	}
+	// The 429 must short-circuit the remaining endpoints in the same round.
+	if firstHits > 1 {
+		t.Errorf("expected the 429 to stop further endpoint requests, got %d hits", firstHits)
+	}
+
+	// Second scrape is within the cooldown window: the device must not be touched.
+	m2 := collectMetrics(t, c)
+	if got := atomic.LoadInt32(&hits); got != firstHits {
+		t.Errorf("second scrape should be skipped during cooldown; hits went %d -> %d", firstHits, got)
+	}
+	if v, ok := gaugeValue(t, m2, "shelly_em_rate_limited"); !ok || v != 1 {
+		t.Errorf("second scrape: expected rate_limited=1 during cooldown, got %v (ok=%v)", v, ok)
+	}
+}
 
 func TestJoinKey(t *testing.T) {
 	tests := []struct {

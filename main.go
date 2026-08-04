@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,8 +40,9 @@ type DeviceConfig struct {
 type Config struct {
 	Devices []DeviceConfig `yaml:"devices"`
 	Server  struct {
-		ListenAddress         string `yaml:"listen_address"`
-		RequestTimeoutSeconds int    `yaml:"request_timeout_seconds"`
+		ListenAddress            string `yaml:"listen_address"`
+		RequestTimeoutSeconds    int    `yaml:"request_timeout_seconds"`
+		RateLimitCooldownSeconds int    `yaml:"rate_limit_cooldown_seconds"`
 	} `yaml:"server"`
 	Metrics struct {
 		EnableGoRuntime bool `yaml:"enable_go_runtime"`
@@ -65,6 +67,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.Server.RequestTimeoutSeconds <= 0 {
 		cfg.Server.RequestTimeoutSeconds = 5
+	}
+	if cfg.Server.RateLimitCooldownSeconds <= 0 {
+		cfg.Server.RateLimitCooldownSeconds = 600
 	}
 
 	if len(cfg.Devices) == 0 {
@@ -99,20 +104,46 @@ func loadConfig(path string) (*Config, error) {
 
 // -------------------- Collector --------------------
 
+// errRateLimited is returned when a device responds with HTTP 429. Shelly
+// firmware 2.0.0 has a bug where the digest-auth challenge path can push the
+// device into a sticky "Too many requests" state in which it stops issuing
+// auth challenges for several minutes. When we hit it we back off instead of
+// hammering the device further.
+var errRateLimited = errors.New("rate limited (HTTP 429 Too Many Requests)")
+
 type ShellyCollector struct {
-	device       DeviceConfig
-	client       *http.Client
-	upDesc       *prometheus.Desc
-	durationDesc *prometheus.Desc
-	valueDesc    *prometheus.Desc
-	infoDesc     *prometheus.Desc
+	device   DeviceConfig
+	client   *http.Client
+	cooldown time.Duration
+
+	upDesc          *prometheus.Desc
+	durationDesc    *prometheus.Desc
+	valueDesc       *prometheus.Desc
+	infoDesc        *prometheus.Desc
+	rateLimitedDesc *prometheus.Desc
+
+	mu            sync.Mutex
+	cooldownUntil time.Time
 }
 
-func NewShellyCollector(device DeviceConfig, timeout time.Duration) *ShellyCollector {
-	// Per-device digest transport (credentials differ per device)
+func NewShellyCollector(device DeviceConfig, timeout, cooldown time.Duration) *ShellyCollector {
+	// Dedicated underlying transport per device so the connection pool (and,
+	// layered on top of it, the digest challenge cache) stays alive for this
+	// device across scrapes instead of borrowing the shared http.DefaultTransport.
+	base := &http.Transport{
+		MaxIdleConns:        2,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	// Per-device digest transport (credentials differ per device). The cached
+	// challenge lives on this transport, so keeping the collector alive means
+	// only the first scrape does the unauthenticated -> 401 -> auth round trip;
+	// subsequent scrapes send digest auth pre-emptively without a fresh 401,
+	// which is exactly the challenge pattern that trips the firmware 2.0.0 bug.
 	t := &digest.Transport{
-		Username: device.Username,
-		Password: device.Password,
+		Username:  device.Username,
+		Password:  device.Password,
+		Transport: base,
 	}
 	httpClient := &http.Client{
 		Transport: t,
@@ -120,8 +151,9 @@ func NewShellyCollector(device DeviceConfig, timeout time.Duration) *ShellyColle
 	}
 
 	return &ShellyCollector{
-		device: device,
-		client: httpClient,
+		device:   device,
+		client:   httpClient,
+		cooldown: cooldown,
 		upDesc: prometheus.NewDesc(
 			"shelly_em_up",
 			"Whether the last scrape of all configured RPC endpoints was successful (1 = yes, 0 = no).",
@@ -143,6 +175,11 @@ func NewShellyCollector(device DeviceConfig, timeout time.Duration) *ShellyColle
 			"Constant info metric about the device (value = 1).",
 			nil, prometheus.Labels{"device": device.Name, "address": device.Address},
 		),
+		rateLimitedDesc: prometheus.NewDesc(
+			"shelly_em_rate_limited",
+			"Whether the device is currently in a rate-limit cooldown after an HTTP 429 response (1 = yes, 0 = no).",
+			nil, prometheus.Labels{"device": device.Name},
+		),
 	}
 }
 
@@ -151,15 +188,31 @@ func (c *ShellyCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.durationDesc
 	ch <- c.valueDesc
 	ch <- c.infoDesc
+	ch <- c.rateLimitedDesc
 }
 
 func (c *ShellyCollector) Collect(ch chan<- prometheus.Metric) {
 	start := time.Now()
-	overallOK := true
 
 	// always expose info
 	ch <- prometheus.MustNewConstMetric(c.infoDesc, prometheus.GaugeValue, 1)
 
+	// If the device recently returned 429, stay in cooldown and do not touch it
+	// again. Poking a rate-limited Shelly only prolongs the sticky 429 state.
+	c.mu.Lock()
+	cooldownUntil := c.cooldownUntil
+	c.mu.Unlock()
+	if now := time.Now(); now.Before(cooldownUntil) {
+		log.Printf("device=%q in rate-limit cooldown, skipping scrape for %.0fs",
+			c.device.Name, cooldownUntil.Sub(now).Seconds())
+		ch <- prometheus.MustNewConstMetric(c.upDesc, prometheus.GaugeValue, 0)
+		ch <- prometheus.MustNewConstMetric(c.rateLimitedDesc, prometheus.GaugeValue, 1)
+		ch <- prometheus.MustNewConstMetric(c.durationDesc, prometheus.GaugeValue, time.Since(start).Seconds())
+		return
+	}
+
+	overallOK := true
+	rateLimited := false
 	flatAll := map[string]float64{}
 
 	for _, ep := range c.device.Endpoints {
@@ -167,12 +220,25 @@ func (c *ShellyCollector) Collect(ch chan<- prometheus.Metric) {
 		values, err := c.fetchAndFlatten(ep)
 		if err != nil {
 			overallOK = false
+			if errors.Is(err, errRateLimited) {
+				rateLimited = true
+				log.Printf("scrape error device=%q endpoint=%q: HTTP 429; backing off for %s",
+					c.device.Name, ep, c.cooldown)
+				// Stop hitting further endpoints on this device this round.
+				break
+			}
 			log.Printf("scrape error device=%q endpoint=%q: %v", c.device.Name, ep, err)
 			continue
 		}
 		for k, v := range values {
 			flatAll[joinKey(prefix, k)] = v
 		}
+	}
+
+	if rateLimited {
+		c.mu.Lock()
+		c.cooldownUntil = time.Now().Add(c.cooldown)
+		c.mu.Unlock()
 	}
 
 	// deterministic order
@@ -190,6 +256,11 @@ func (c *ShellyCollector) Collect(ch chan<- prometheus.Metric) {
 	} else {
 		ch <- prometheus.MustNewConstMetric(c.upDesc, prometheus.GaugeValue, 0)
 	}
+	rl := 0.0
+	if rateLimited {
+		rl = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.rateLimitedDesc, prometheus.GaugeValue, rl)
 	ch <- prometheus.MustNewConstMetric(c.durationDesc, prometheus.GaugeValue, time.Since(start).Seconds())
 }
 
@@ -208,6 +279,10 @@ func (c *ShellyCollector) fetchAndFlatten(relativePath string) (map[string]float
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("%w: %s", errRateLimited, strings.TrimSpace(string(body)))
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
@@ -257,7 +332,7 @@ func flattenJSON(prefix string, v any, out map[string]float64) {
 		out[prefix] = float64(t)
 	case uint64:
 		out[prefix] = float64(t)
-	// ignore other types
+		// ignore other types
 	}
 }
 
@@ -306,37 +381,50 @@ func endpointKeyPrefix(endpoint string) string {
 	return ep
 }
 
-// -------------------- HTTP / Dynamic registry per request --------------------
+// -------------------- HTTP / Exporter --------------------
 
-// buildRegistry constructs a fresh registry for the given set of devices.
-// If deviceName is non-empty, only that device is scraped.
-func buildRegistry(cfg *Config, deviceName string) (*prometheus.Registry, error) {
+// Exporter owns the long-lived per-device collectors. Building them once at
+// startup (instead of per request) keeps each device's digest challenge cache
+// and connection pool alive across scrapes, so the exporter no longer re-runs
+// the unauthenticated -> 401 -> auth handshake on every single scrape.
+type Exporter struct {
+	cfg        *Config
+	collectors map[string]*ShellyCollector
+	order      []string
+}
+
+func NewExporter(cfg *Config) *Exporter {
 	timeout := time.Duration(cfg.Server.RequestTimeoutSeconds) * time.Second
+	cooldown := time.Duration(cfg.Server.RateLimitCooldownSeconds) * time.Second
+
+	collectors := make(map[string]*ShellyCollector, len(cfg.Devices))
+	order := make([]string, 0, len(cfg.Devices))
+	for _, d := range cfg.Devices {
+		collectors[d.Name] = NewShellyCollector(d, timeout, cooldown)
+		order = append(order, d.Name)
+	}
+	return &Exporter{cfg: cfg, collectors: collectors, order: order}
+}
+
+// buildRegistry constructs a fresh registry wired to the long-lived collectors.
+// If deviceName is non-empty, only that device is scraped.
+func (e *Exporter) buildRegistry(deviceName string) (*prometheus.Registry, error) {
 	reg := prometheus.NewRegistry()
 
-	var targets []DeviceConfig
 	if deviceName != "" {
-		found := false
-		for _, d := range cfg.Devices {
-			if d.Name == deviceName {
-				targets = []DeviceConfig{d}
-				found = true
-				break
-			}
+		col, ok := e.collectors[deviceName]
+		if !ok {
+			return nil, fmt.Errorf("unknown device %q (available: %s)", deviceName, strings.Join(e.order, ", "))
 		}
-		if !found {
-			return nil, fmt.Errorf("unknown device %q (available: %s)", deviceName, strings.Join(deviceNames(cfg.Devices), ", "))
-		}
+		reg.MustRegister(col)
 	} else {
 		// no device param -> scrape all
-		targets = cfg.Devices
+		for _, name := range e.order {
+			reg.MustRegister(e.collectors[name])
+		}
 	}
 
-	for _, d := range targets {
-		reg.MustRegister(NewShellyCollector(d, timeout))
-	}
-
-	if cfg.Metrics.EnableGoRuntime {
+	if e.cfg.Metrics.EnableGoRuntime {
 		reg.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 		reg.MustRegister(prometheus.NewGoCollector())
 	}
@@ -352,10 +440,10 @@ func deviceNames(devs []DeviceConfig) []string {
 	return names
 }
 
-func metricsHandler(cfg *Config) http.Handler {
+func (e *Exporter) metricsHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		deviceName := r.URL.Query().Get("device")
-		reg, err := buildRegistry(cfg, deviceName)
+		reg, err := e.buildRegistry(deviceName)
 		if err != nil {
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
@@ -437,8 +525,10 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
+	exporter := NewExporter(cfg)
+
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", metricsHandler(cfg))
+	mux.Handle("/metrics", exporter.metricsHandler())
 	mux.Handle("/healthz", healthzHandler())
 	mux.Handle("/", landingPageHandler(cfg))
 
@@ -447,8 +537,9 @@ func main() {
 		Handler: mux,
 	}
 
-	log.Printf("starting Shelly exporter on %s | devices: [%s] | go_runtime_metrics=%v",
-		cfg.Server.ListenAddress, strings.Join(deviceNames(cfg.Devices), ", "), cfg.Metrics.EnableGoRuntime)
+	log.Printf("starting Shelly exporter on %s | devices: [%s] | go_runtime_metrics=%v | rate_limit_cooldown=%ds",
+		cfg.Server.ListenAddress, strings.Join(deviceNames(cfg.Devices), ", "),
+		cfg.Metrics.EnableGoRuntime, cfg.Server.RateLimitCooldownSeconds)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
